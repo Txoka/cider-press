@@ -1,0 +1,4 @@
+CiderPress round-trip integration asset.
+This file is used by pytest to validate compress/decompress flow.
+Line 3 contains symbols: !@#$%^&*()[]{}<>?/|\\
+Line 4 contains unicode: café naïve jalapeño — and emojis are intentionally omitted.
