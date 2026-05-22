@@ -96,7 +96,7 @@ def test_header_roundtrip(cider):
         env_hash=env_hash,
     )
     out = cider.parse_header_bytes(hb)
-    assert out["version"] == 4
+    assert out["version"] == 6
     assert out["model"] == "m"
     assert out["revision"] == "r"
     assert out["max_ctx"] == 1024
@@ -109,11 +109,36 @@ def test_header_roundtrip(cider):
     assert out["trust_remote_code"] is True
     assert out["force_math_sdpa"] is True
     assert out["env_hash"] == env_hash
+    assert out["coding_scheme"] == "range"
+    assert out["content_kind"] == "text"
+
+
+def test_header_roundtrip_with_ans_coding(cider):
+    hb = cider.build_header_bytes(
+        model_id="m",
+        revision=None,
+        max_ctx=16,
+        n_tokens=3,
+        dev="cpu",
+        dtype="fp32",
+        use_cache=False,
+        perfect=False,
+        strict_det=False,
+        trust_remote_code=False,
+        force_math_sdpa=False,
+        env_hash=None,
+        coding_scheme="ans",
+        content_kind="text_archive",
+    )
+    out = cider.parse_header_bytes(hb)
+    assert out["version"] == 6
+    assert out["coding_scheme"] == "ans"
+    assert out["content_kind"] == "text_archive"
 
 
 def test_parse_header_rejects_unknown_version(cider):
     with pytest.raises(ValueError, match="Unsupported header version"):
-        cider.parse_header_bytes(cider.uvarint_encode(5) + cider.uvarint_encode(0))
+        cider.parse_header_bytes(cider.uvarint_encode(7) + cider.uvarint_encode(0))
 
 
 def test_write_read_container_roundtrip(cider, tmp_path):
@@ -139,6 +164,31 @@ def test_write_read_container_roundtrip(cider, tmp_path):
     assert parsed["model"] == "m"
     assert out_payload == payload
     assert header_total == len(cider.MAGIC) + len(cider.uvarint_encode(len(header))) + len(header)
+
+
+def test_text_archive_roundtrip_skips_non_utf8(cider, tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "sub").mkdir()
+    (src / "sub" / "a.txt").write_text("hello\n", encoding="utf-8")
+    (src / "empty").mkdir()
+    (src / "binary.bin").write_bytes(b"\xff\xfe\x00")
+    (src / "nul.txt").write_bytes(b"text\x00")
+
+    archive_mod = importlib.import_module("ciderpress.text_archive")
+    text, n_files, n_dirs, skipped = archive_mod.build_text_archive(str(src))
+    assert n_files == 1
+    assert n_dirs == 2
+    assert skipped == 2
+
+    out = tmp_path / "out"
+    restored_files, restored_dirs = archive_mod.extract_text_archive(text, str(out))
+    assert restored_files == 1
+    assert restored_dirs == 2
+    assert (out / "sub" / "a.txt").read_text(encoding="utf-8") == "hello\n"
+    assert (out / "empty").is_dir()
+    assert not (out / "binary.bin").exists()
+    assert not (out / "nul.txt").exists()
 
 
 def test_read_container_errors(cider, tmp_path):
@@ -229,6 +279,33 @@ def test_compress_decompress_roundtrip_with_stub_stepper(cider, monkeypatch):
     tokens = [0, 1, 2, 0]
     comp, nll = cider.compress_tokens_sequential(llm, tokens, perfect=True, show_progress=False)
     out = cider.decompress_tokens_sequential(llm, comp, n_tokens=len(tokens), perfect=True, show_progress=False)
+    assert out == tokens
+    assert isinstance(nll, float)
+
+
+def test_ans_compress_decompress_roundtrip_with_stub_stepper(cider, monkeypatch):
+    monkeypatch.setattr(cider, "Stepper", _FakeStepper)
+
+    class _L:
+        pass
+
+    llm = _L()
+    tokens = [0, 1, 2, 0]
+    comp, nll = cider.compress_tokens_sequential(
+        llm,
+        tokens,
+        perfect=True,
+        show_progress=False,
+        coding_scheme="ans",
+    )
+    out = cider.decompress_tokens_sequential(
+        llm,
+        comp,
+        n_tokens=len(tokens),
+        perfect=True,
+        show_progress=False,
+        coding_scheme="ans",
+    )
     assert out == tokens
     assert isinstance(nll, float)
 
@@ -403,6 +480,53 @@ def test_main_compress_then_decompress(cider, monkeypatch, tmp_path):
     assert rec.read_text(encoding="utf-8") == "hello"
 
 
+def test_main_compress_then_decompress_text_directory(cider, monkeypatch, tmp_path):
+    class _FakeLLM:
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.max_ctx = 64
+            self.vocab_size = 256
+            self.start_id = 0
+
+        def encode_text(self, text):
+            return [ord(c) for c in text]
+
+        def decode_tokens(self, toks):
+            return "".join(chr(int(x)) for x in toks)
+
+    monkeypatch.setattr(cider, "LLM", _FakeLLM)
+    monkeypatch.setattr(
+        cider,
+        "compress_tokens_sequential",
+        lambda llm, tokens, perfect, show_progress: (np.array(tokens, dtype=np.uint32), 0.5),
+    )
+    monkeypatch.setattr(
+        cider,
+        "decompress_tokens_sequential",
+        lambda llm, compressed_u32, n_tokens, perfect, show_progress: [int(x) for x in compressed_u32.tolist()][:n_tokens],
+    )
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "sub").mkdir()
+    (src / "sub" / "a.txt").write_text("hello\n", encoding="utf-8")
+    (src / "binary.bin").write_bytes(b"\xff\xfe\x00")
+    out = tmp_path / "dir.llmz"
+    rec = tmp_path / "rec"
+
+    monkeypatch.setattr(sys, "argv", ["cider.py", "compress", "--in", str(src), "--out", str(out), "--model", "m", "--device", "cpu", "--dtype", "fp32", "--no-progress", "--verify"])
+    cider.main()
+    assert out.exists()
+
+    header, _, _ = cider.read_container(str(out))
+    assert header["content_kind"] == "text_archive"
+
+    monkeypatch.setattr(sys, "argv", ["cider.py", "decompress", "--in", str(out), "--out", str(rec), "--model", "m", "--device", "cpu", "--dtype", "fp32", "--no-progress"])
+    cider.main()
+    assert (rec / "sub" / "a.txt").read_text(encoding="utf-8") == "hello\n"
+    assert not (rec / "binary.bin").exists()
+
+
 def test_main_decompress_envhash_mismatch_exits(cider, monkeypatch, tmp_path):
     class _FakeLLM:
         def __init__(self, cfg):
@@ -443,6 +567,7 @@ def test_cli_common_arguments_exposed():
     assert "--revision" in names
     assert "--device" in names
     assert "--dtype" in names
+    assert "--coding" in names
 
 
 def test_cli_has_no_test_subcommand():

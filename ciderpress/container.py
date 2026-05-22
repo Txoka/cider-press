@@ -73,6 +73,10 @@ def unpack_bytes(buf: bytes, off: int) -> Tuple[Optional[bytes], int]:
 
 DTYPE_ENUM = {"fp32": 0, "bf16": 1, "fp16": 2}
 DTYPE_ENUM_REV = {v: k for k, v in DTYPE_ENUM.items()}
+CODING_ENUM = {"range": 0, "ans": 1}
+CODING_ENUM_REV = {v: k for k, v in CODING_ENUM.items()}
+CONTENT_ENUM = {"text": 0, "text_archive": 1}
+CONTENT_ENUM_REV = {v: k for k, v in CONTENT_ENUM.items()}
 
 
 def build_header_bytes(
@@ -89,8 +93,15 @@ def build_header_bytes(
     trust_remote_code: bool,
     force_math_sdpa: bool,
     env_hash: Optional[bytes],
+    coding_scheme: str = "range",
+    content_kind: str = "text",
 ) -> bytes:
-    version = 4
+    if coding_scheme not in CODING_ENUM:
+        raise ValueError(f"Unsupported coding scheme: {coding_scheme}")
+    if content_kind not in CONTENT_ENUM:
+        raise ValueError(f"Unsupported content kind: {content_kind}")
+
+    version = 6
     flags = 0
     flags |= (1 if perfect else 0) << 0
     flags |= (1 if strict_det else 0) << 1
@@ -109,11 +120,15 @@ def build_header_bytes(
     hb += pack_str(model_id)
     hb += pack_str(revision)
     hb += pack_bytes(env_hash)
+    hb += uvarint_encode(CODING_ENUM[coding_scheme])
+    hb += uvarint_encode(CONTENT_ENUM[content_kind])
     return bytes(hb)
 
 
 def parse_header_bytes(hb: bytes) -> dict:
     off = 0
+    coding_id = CODING_ENUM["range"]
+    content_id = CONTENT_ENUM["text"]
     version, off = uvarint_decode(hb, off)
     if version == 1:
         flags, off = uvarint_decode(hb, off)
@@ -136,7 +151,7 @@ def parse_header_bytes(hb: bytes) -> dict:
         model_id, off = unpack_str(hb, off)
         revision, off = unpack_str(hb, off)
         env_hash, off = unpack_bytes(hb, off)
-    elif version in (3, 4):
+    elif version in (3, 4, 5, 6):
         flags, off = uvarint_decode(hb, off)
         max_ctx, off = uvarint_decode(hb, off)
         n_tokens, off = uvarint_decode(hb, off)
@@ -144,11 +159,23 @@ def parse_header_bytes(hb: bytes) -> dict:
         model_id, off = unpack_str(hb, off)
         revision, off = unpack_str(hb, off)
         env_hash, off = unpack_bytes(hb, off)
+        if version >= 5:
+            coding_id, off = uvarint_decode(hb, off)
+        else:
+            coding_id = CODING_ENUM["range"]
+        if version >= 6:
+            content_id, off = uvarint_decode(hb, off)
+        else:
+            content_id = CONTENT_ENUM["text"]
     else:
         raise ValueError(f"Unsupported header version: {version}")
 
     dtype_enum = (flags >> 4) & 0x3
     dtype = DTYPE_ENUM_REV.get(dtype_enum, "fp32")
+    if int(coding_id) not in CODING_ENUM_REV:
+        raise ValueError(f"Unsupported coding scheme id: {coding_id}")
+    if int(content_id) not in CONTENT_ENUM_REV:
+        raise ValueError(f"Unsupported content kind id: {content_id}")
 
     is_cuda = bool((flags >> 6) & 1)
     dev = f"cuda:{cuda_idx}" if is_cuda else "cpu"
@@ -168,6 +195,8 @@ def parse_header_bytes(hb: bytes) -> dict:
         "model": model_id,
         "revision": revision,
         "env_hash": env_hash,
+        "coding_scheme": CODING_ENUM_REV[int(coding_id)],
+        "content_kind": CONTENT_ENUM_REV[int(content_id)],
     }
     if version in (1, 2):
         out["n_words_u32"] = int(n_words_u32)

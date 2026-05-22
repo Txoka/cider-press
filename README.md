@@ -1,6 +1,6 @@
 # CiderPress
 
-`CiderPress` is an LLM-guided text compressor built on constriction range coding.
+`CiderPress` is an LLM-guided text compressor built on constriction entropy coding.
 The implementation is modular under `ciderpress/` with `press.py` as the main CLI entrypoint.
 A backward-compatible alias `cider.py` is also available.
 
@@ -40,6 +40,22 @@ Determinism configuration is optional and disabled by default. Enable it explici
 
 ```bash
 python press.py compress --determinism on ...
+```
+
+The default entropy coder is range coding. ANS is also available:
+
+```bash
+python press.py compress --coding ans --in input.txt --out output.llmz
+python press.py decompress --in output.llmz --out recovered.txt
+```
+
+Directories are supported as text archives. CiderPress records UTF-8 regular files and
+directories in deterministic path order; files that are not valid UTF-8, symlinks, and
+other special files are skipped.
+
+```bash
+python press.py compress --in ./src --out src.llmz
+python press.py decompress --in src.llmz --out ./src.recovered
 ```
 
 Environment compatibility hash is stored as a truncated 16-byte SHA-256 digest by default.

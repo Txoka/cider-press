@@ -36,6 +36,14 @@ COMMON_ARGUMENTS: List[Tuple[str, Dict]] = [
         "--no-progress",
         {"action": "store_true", "help": "Disable tqdm progress bars (useful for logs / piping)."},
     ),
+    (
+        "--coding",
+        {
+            "choices": ["range", "ans"],
+            "default": None,
+            "help": "Entropy coding scheme. Compress defaults to range; decompress reads the file header unless overridden.",
+        },
+    ),
     ("--no-store-model", {"action": "store_true", "help": "Do not store model id in header."}),
     ("--no-store-revision", {"action": "store_true", "help": "Do not store revision in header."}),
     (
@@ -48,7 +56,7 @@ COMMON_ARGUMENTS: List[Tuple[str, Dict]] = [
 ]
 
 COMPRESS_ARGUMENTS: List[Tuple[str, Dict]] = [
-    ("--in", {"dest": "inp", "required": True}),
+    ("--in", {"dest": "inp", "required": True, "help": "Input text file or directory of UTF-8 text files."}),
     ("--out", {"dest": "out", "required": True}),
     ("--encoding", {"default": "utf-8", "help": "Input text encoding (default utf-8)."}),
     ("--verify", {"action": "store_true", "help": "Decompress immediately and verify byte-equality."}),
