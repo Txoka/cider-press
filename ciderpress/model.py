@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import os
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -22,6 +22,130 @@ _disable_optional_torchvision()
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:
+    from transformers import Cache
+except Exception:  # pragma: no cover
+    Cache = object
+
+
+CACHE_POLICY_DYNAMIC = "dynamic"
+CACHE_POLICY_STREAMING_LLM = "streaming_llm"
+
+
+class StreamingLLMSinkCache(Cache):
+    """Attention-sink KV cache for token-by-token compression/decompression."""
+
+    def __init__(self, window_length: int, num_sink_tokens: int) -> None:
+        try:
+            super().__init__(layers=[])
+        except TypeError:
+            super().__init__()
+        self.key_cache: List[torch.Tensor] = []
+        self.value_cache: List[torch.Tensor] = []
+        self.window_length = int(window_length)
+        self.num_sink_tokens = int(num_sink_tokens)
+        self.cos_sin_rerotation_cache = {}
+        self._cos_cache = None
+        self._sin_cache = None
+
+    @staticmethod
+    def _rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _apply_key_rotary_pos_emb(self, key_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        return (key_states * cos) + (self._rotate_half(key_states) * sin)
+
+    def _get_rerotation_cos_sin(self, key_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if key_states.shape[-2] not in self.cos_sin_rerotation_cache:
+            cos = cos.to(torch.float32)
+            sin = sin.to(torch.float32)
+            original_cos = cos[self.num_sink_tokens + key_states.shape[-2] :]
+            shifted_cos = cos[self.num_sink_tokens : -key_states.shape[-2]]
+            original_sin = sin[self.num_sink_tokens + key_states.shape[-2] :]
+            shifted_sin = sin[self.num_sink_tokens : -key_states.shape[-2]]
+            rerotation_cos = original_cos * shifted_cos + original_sin * shifted_sin
+            rerotation_sin = -original_sin * shifted_cos + original_cos * shifted_sin
+            self.cos_sin_rerotation_cache[key_states.shape[-2]] = (
+                rerotation_cos.to(key_states.dtype).unsqueeze(0),
+                rerotation_sin.to(key_states.dtype).unsqueeze(0),
+            )
+        return self.cos_sin_rerotation_cache[key_states.shape[-2]]
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        if layer_idx is None or len(self.key_cache) <= layer_idx:
+            return 0
+        return self.key_cache[layer_idx].shape[-2]
+
+    def get_max_cache_shape(self) -> int:
+        return self.window_length
+
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> Tuple[int, int]:
+        return cache_position.shape[0] + self.get_seq_length(layer_idx), 0
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if cache_kwargs is None:
+            cache_kwargs = {}
+        sin = cache_kwargs.get("sin")
+        cos = cache_kwargs.get("cos")
+        partial_rotation_size = cache_kwargs.get("partial_rotation_size")
+        using_rope = cos is not None and sin is not None
+
+        if using_rope and layer_idx == 0:
+            if cos.dim() == 2:
+                self._cos_cache = cos
+                self._sin_cache = sin
+            else:
+                if self._cos_cache is None:
+                    self._cos_cache = cos[0, ...]
+                    self._sin_cache = sin[0, ...]
+                elif self._cos_cache.shape[0] < self.window_length:
+                    self._cos_cache = torch.cat([self._cos_cache, cos[0, ...]], dim=0)
+                    self._sin_cache = torch.cat([self._sin_cache, sin[0, ...]], dim=0)
+
+        if len(self.key_cache) <= layer_idx:
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+        elif key_states.shape[-2] + self.get_seq_length(layer_idx) < self.window_length:
+            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
+        else:
+            keys_to_keep = self.key_cache[layer_idx][
+                :, :, -self.window_length + self.num_sink_tokens + key_states.shape[-2] :
+            ]
+            if using_rope:
+                rerotation_cos, rerotation_sin = self._get_rerotation_cos_sin(
+                    key_states,
+                    self._cos_cache[: self.window_length],
+                    self._sin_cache[: self.window_length],
+                )
+                if partial_rotation_size is not None:
+                    keys_to_keep, keys_pass = (
+                        keys_to_keep[..., :partial_rotation_size],
+                        keys_to_keep[..., partial_rotation_size:],
+                    )
+                keys_to_keep = self._apply_key_rotary_pos_emb(keys_to_keep, rerotation_cos, rerotation_sin)
+                if partial_rotation_size is not None:
+                    keys_to_keep = torch.cat((keys_to_keep, keys_pass), dim=-1)
+
+            sink_keys = self.key_cache[layer_idx][:, :, : self.num_sink_tokens]
+            self.key_cache[layer_idx] = torch.cat([sink_keys, keys_to_keep, key_states], dim=-2)
+
+            sink_values = self.value_cache[layer_idx][:, :, : self.num_sink_tokens]
+            values_to_keep = self.value_cache[layer_idx][
+                :, :, -self.window_length + self.num_sink_tokens + value_states.shape[-2] :
+            ]
+            self.value_cache[layer_idx] = torch.cat([sink_values, values_to_keep, value_states], dim=-2)
+
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
 
 @dataclass
 class LLMConfig:
@@ -32,6 +156,8 @@ class LLMConfig:
     max_ctx: int
     use_cache: bool
     trust_remote_code: bool
+    cache_policy: str = CACHE_POLICY_DYNAMIC
+    sink_tokens: int = 4
 
 
 def load_model(model_id: str, revision: Optional[str], dtype: torch.dtype, trust_remote_code: bool):
@@ -97,13 +223,21 @@ class Stepper:
         self.llm = llm
         self.device = llm.cfg.device
         self.use_cache = llm.cfg.use_cache
+        self.cache_policy = llm.cfg.cache_policy
         self.ctx: List[int] = [llm.start_id]
-        self.past = None
+        self.past = self._make_cache() if self.use_cache else None
 
         x0 = torch.tensor([[llm.start_id]], dtype=torch.long, device=self.device)
-        out0 = self._forward(input_ids=x0, use_cache=self.use_cache)
+        out0 = self._forward(input_ids=x0, use_cache=self.use_cache, past_key_values=self.past)
         self.logits_next = out0.logits[0, -1, :]
         self.past = out0.past_key_values if self.use_cache else None
+
+    def _make_cache(self):
+        if self.cache_policy == CACHE_POLICY_STREAMING_LLM:
+            if self.llm.max_ctx <= self.llm.cfg.sink_tokens:
+                raise ValueError("--max-ctx must be larger than --sink-tokens for streaming_llm")
+            return StreamingLLMSinkCache(window_length=self.llm.max_ctx, num_sink_tokens=self.llm.cfg.sink_tokens)
+        return None
 
     def _forward(self, **kwargs):
         try:
@@ -118,7 +252,7 @@ class Stepper:
     def step(self, token: int) -> None:
         self.ctx.append(int(token))
 
-        if (not self.use_cache) or (self.past is None) or (len(self.ctx) > self.llm.max_ctx):
+        if (not self.use_cache) or (self.past is None) or (self.cache_policy == CACHE_POLICY_DYNAMIC and len(self.ctx) > self.llm.max_ctx):
             self.ctx = self.ctx[-self.llm.max_ctx:]
             x = torch.tensor([self.ctx], dtype=torch.long, device=self.device)
             out = self._forward(input_ids=x, use_cache=self.use_cache)

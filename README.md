@@ -58,6 +58,14 @@ python press.py compress --in ./src --out src.llmz
 python press.py decompress --in src.llmz --out ./src.recovered
 ```
 
+When tokenized input is longer than the active context window, CiderPress automatically
+uses a StreamingLLM-style attention-sink cache. The default is 4 sink tokens and the
+active `--max-ctx` value as the cache window. You can force it explicitly:
+
+```bash
+python press.py compress --cache-policy streaming_llm --sink-tokens 4 --max-ctx 4096 ...
+```
+
 Environment compatibility hash is stored as a truncated 16-byte SHA-256 digest by default.
 
 ## Run tests
