@@ -44,6 +44,18 @@ COMMON_ARGUMENTS: List[Tuple[str, Dict]] = [
             "help": "Entropy coding scheme. Compress defaults to range; decompress reads the file header unless overridden.",
         },
     ),
+    (
+        "--cache-policy",
+        {
+            "choices": ["dynamic", "streaming_llm"],
+            "default": None,
+            "help": "KV-cache policy. Decompress reads the file header unless overridden.",
+        },
+    ),
+    (
+        "--sink-tokens",
+        {"type": int, "default": 4, "help": "Number of initial attention-sink tokens for --cache-policy streaming_llm."},
+    ),
     ("--no-store-model", {"action": "store_true", "help": "Do not store model id in header."}),
     ("--no-store-revision", {"action": "store_true", "help": "Do not store revision in header."}),
     (

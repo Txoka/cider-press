@@ -11,7 +11,7 @@ from .codec import compress_tokens_sequential, decompress_tokens_sequential
 from .container import MAGIC, build_header_bytes, read_container, uvarint_encode, write_container
 from .determinism import canonical_device, configure_determinism, device_is_cuda
 from .fingerprint import env_fingerprint_hash_bytes
-from .model import LLM, LLMConfig, Stepper
+from .model import CACHE_POLICY_DYNAMIC, CACHE_POLICY_STREAMING_LLM, LLM, LLMConfig, Stepper
 from .text_archive import build_text_archive, extract_text_archive
 
 DEFAULT_SEED = 0
@@ -62,6 +62,12 @@ def cmd_compress(
     dtype = resolve_dtype(dev, args.dtype)
     show_progress = (not args.no_progress)
     coding_scheme = getattr(args, "coding", None) or "range"
+    cache_policy_arg = getattr(args, "cache_policy", None)
+    cache_policy = cache_policy_arg or CACHE_POLICY_DYNAMIC
+    max_ctx_arg = args.max_ctx
+    sink_tokens = int(args.sink_tokens)
+    if cache_policy == CACHE_POLICY_STREAMING_LLM and args.no_cache:
+        raise SystemExit("--cache-policy streaming_llm requires cache; remove --no-cache.")
 
     if args.determinism == "on":
         configure_determinism(DEFAULT_SEED, dev, strict=args.strict_determinism, force_math_sdpa=args.force_math_sdpa)
@@ -73,12 +79,19 @@ def cmd_compress(
         revision=args.revision,
         device=dev,
         dtype=dtype,
-        max_ctx=args.max_ctx,
+        max_ctx=max_ctx_arg,
         use_cache=(not args.no_cache),
         trust_remote_code=args.trust_remote_code,
+        cache_policy=cache_policy,
+        sink_tokens=sink_tokens,
     ))
 
     tokens = llm.encode_text(text)
+    if cache_policy_arg is None and (not args.no_cache) and len(tokens) > llm.max_ctx:
+        cache_policy = CACHE_POLICY_STREAMING_LLM
+        llm.cfg.cache_policy = cache_policy
+    if cache_policy == CACHE_POLICY_STREAMING_LLM and sink_tokens >= llm.max_ctx:
+        raise SystemExit(f"--sink-tokens ({sink_tokens}) must be smaller than max_ctx ({llm.max_ctx}).")
     compressed_u32, avg_nll_bits = _call_with_optional_coding(
         compress_fn,
         llm,
@@ -100,6 +113,8 @@ def cmd_compress(
             force_math_sdpa=bool(args.force_math_sdpa),
             model_id=args.model,
             revision=args.revision or "",
+            cache_policy=cache_policy,
+            sink_tokens=sink_tokens,
         )
 
     header_bytes = build_header_bytes(
@@ -117,6 +132,8 @@ def cmd_compress(
         env_hash=env_hash,
         coding_scheme=coding_scheme,
         content_kind=content_kind,
+        cache_policy=cache_policy,
+        sink_tokens=sink_tokens,
     )
 
     write_container(args.out, header_bytes, payload)
@@ -134,7 +151,7 @@ def cmd_compress(
     print(f"Compressed: {in_bytes} -> {out_bytes} bytes (ratio {out_bytes / max(1, in_bytes):.6f})")
     print(f"Header bytes: {header_total} | Payload bytes: {payload_bytes}")
     print(f"Input: {input_summary}")
-    print(f"Tokens: {len(tokens)}, vocab={llm.vocab_size}, device={dev}, dtype={dtype}, perfect={bool(args.perfect)}, coding={coding_scheme}")
+    print(f"Tokens: {len(tokens)}, vocab={llm.vocab_size}, device={dev}, dtype={dtype}, perfect={bool(args.perfect)}, coding={coding_scheme}, cache={cache_policy}, max_ctx={llm.max_ctx}")
     print(f"bits/token TOTAL:   {bits_per_token_total:.6f}")
     print(f"bits/token PAYLOAD: {bits_per_token_payload:.6f}")
     print(f"bits/byte  TOTAL:   {bits_per_byte_total:.6f}")
@@ -185,6 +202,8 @@ def cmd_decompress(args, argv=None, *, llm_cls=LLM, decompress_fn=decompress_tok
     revision = header.get("revision") or args.revision
     coding_scheme = getattr(args, "coding", None) or str(header.get("coding_scheme", "range"))
     content_kind = str(header.get("content_kind", "text"))
+    cache_policy = getattr(args, "cache_policy", None) or str(header.get("cache_policy", CACHE_POLICY_DYNAMIC))
+    sink_tokens = int(header.get("sink_tokens", args.sink_tokens))
 
     dev_used = dev if "--device" in argv else header["device"]
     dtype_used = dtype if "--dtype" in argv else header["dtype"]
@@ -204,6 +223,8 @@ def cmd_decompress(args, argv=None, *, llm_cls=LLM, decompress_fn=decompress_tok
             force_math_sdpa=bool(header["force_math_sdpa"]) if "--force-math-sdpa" not in argv else bool(args.force_math_sdpa),
             model_id=(model_id or "") if use_model_identity else "",
             revision=(revision or "") if use_model_identity else "",
+            cache_policy=cache_policy,
+            sink_tokens=sink_tokens,
         )
         if computed_env != stored_env:
             print("Env-hash mismatch (truncated sha256 digest).")
@@ -228,6 +249,8 @@ def cmd_decompress(args, argv=None, *, llm_cls=LLM, decompress_fn=decompress_tok
         max_ctx=int(header.get("max_ctx", 0)) if args.max_ctx == 0 else args.max_ctx,
         use_cache=bool(header.get("use_cache", True)) if "--no-cache" not in argv else (not args.no_cache),
         trust_remote_code=args.trust_remote_code or bool(header.get("trust_remote_code", False)),
+        cache_policy=cache_policy,
+        sink_tokens=sink_tokens,
     ))
 
     n_tokens = int(header["n_tokens"])
@@ -257,5 +280,5 @@ def cmd_decompress(args, argv=None, *, llm_cls=LLM, decompress_fn=decompress_tok
     else:
         raise SystemExit(f"Unsupported content kind: {content_kind}")
 
-    print(f"Header bytes: {header_total} | Payload bytes: {len(payload)} | Coding: {coding_scheme} | Content: {content_kind}")
+    print(f"Header bytes: {header_total} | Payload bytes: {len(payload)} | Coding: {coding_scheme} | Content: {content_kind} | Cache: {cache_policy}")
     return 0

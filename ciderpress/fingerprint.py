@@ -22,6 +22,8 @@ def env_fingerprint_string(
     force_math_sdpa: bool,
     model_id: str = "",
     revision: str = "",
+    cache_policy: str = "dynamic",
+    sink_tokens: int = 4,
 ) -> str:
     def _safe_call(fn, default="?"):
         try:
@@ -43,6 +45,8 @@ def env_fingerprint_string(
         f"math_sdpa={int(force_math_sdpa)}",
         f"model_id={model_id or ''}",
         f"revision={revision or ''}",
+        f"cache_policy={cache_policy}",
+        f"sink_tokens={int(sink_tokens)}",
         f"tf32_matmul={int(torch.backends.cuda.matmul.allow_tf32)}",
         f"tf32_cudnn={int(torch.backends.cudnn.allow_tf32)}",
     ]

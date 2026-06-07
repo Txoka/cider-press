@@ -13,6 +13,8 @@ from ciderpress.container import (
     CODING_ENUM_REV,
     CONTENT_ENUM,
     CONTENT_ENUM_REV,
+    CACHE_POLICY_ENUM,
+    CACHE_POLICY_ENUM_REV,
     DTYPE_ENUM,
     DTYPE_ENUM_REV,
     MAGIC,

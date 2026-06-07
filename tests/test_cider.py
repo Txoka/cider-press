@@ -96,7 +96,7 @@ def test_header_roundtrip(cider):
         env_hash=env_hash,
     )
     out = cider.parse_header_bytes(hb)
-    assert out["version"] == 6
+    assert out["version"] == 7
     assert out["model"] == "m"
     assert out["revision"] == "r"
     assert out["max_ctx"] == 1024
@@ -111,6 +111,8 @@ def test_header_roundtrip(cider):
     assert out["env_hash"] == env_hash
     assert out["coding_scheme"] == "range"
     assert out["content_kind"] == "text"
+    assert out["cache_policy"] == "dynamic"
+    assert out["sink_tokens"] == 4
 
 
 def test_header_roundtrip_with_ans_coding(cider):
@@ -129,16 +131,19 @@ def test_header_roundtrip_with_ans_coding(cider):
         env_hash=None,
         coding_scheme="ans",
         content_kind="text_archive",
+        cache_policy="streaming_llm",
+        sink_tokens=4,
     )
     out = cider.parse_header_bytes(hb)
-    assert out["version"] == 6
+    assert out["version"] == 7
     assert out["coding_scheme"] == "ans"
     assert out["content_kind"] == "text_archive"
+    assert out["cache_policy"] == "streaming_llm"
 
 
 def test_parse_header_rejects_unknown_version(cider):
     with pytest.raises(ValueError, match="Unsupported header version"):
-        cider.parse_header_bytes(cider.uvarint_encode(7) + cider.uvarint_encode(0))
+        cider.parse_header_bytes(cider.uvarint_encode(8) + cider.uvarint_encode(0))
 
 
 def test_write_read_container_roundtrip(cider, tmp_path):
@@ -397,6 +402,19 @@ def test_llm_init_and_codec_methods(cider, monkeypatch):
     assert llm.decode_tokens([1, 2]) == "1|2"
 
 
+def test_streaming_llm_sink_cache_keeps_sinks_and_recent(cider, monkeypatch):
+    model_mod = importlib.import_module("ciderpress.model")
+    monkeypatch.setattr(model_mod, "torch", types.SimpleNamespace(cat=lambda xs, dim: np.concatenate(xs, axis=dim)))
+    cache = model_mod.StreamingLLMSinkCache(window_length=5, num_sink_tokens=2)
+    for i in range(7):
+        k = np.full((1, 1, 1, 1), i, dtype=np.float32)
+        v = np.full((1, 1, 1, 1), i, dtype=np.float32)
+        cache.update(k, v, 0, {})
+    assert cache.get_seq_length() == 5
+    assert cache.key_cache[0].reshape(-1).tolist() == [0, 1, 4, 5, 6]
+    assert cache.get_mask_sizes(np.zeros((1,), dtype=np.int64), 0) == (6, 0)
+
+
 def test_determinism_logic_in_pytest(cider, monkeypatch):
     class _FakeLLM:
         def __init__(self, _cfg=None):
@@ -525,6 +543,38 @@ def test_main_compress_then_decompress_text_directory(cider, monkeypatch, tmp_pa
     cider.main()
     assert (rec / "sub" / "a.txt").read_text(encoding="utf-8") == "hello\n"
     assert not (rec / "binary.bin").exists()
+
+
+def test_main_auto_streaming_llm_for_input_beyond_context(cider, monkeypatch, tmp_path):
+    class _FakeLLM:
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.max_ctx = int(cfg.max_ctx)
+            self.vocab_size = 256
+            self.start_id = 0
+
+        def encode_text(self, text):
+            return [ord(c) for c in text]
+
+        def decode_tokens(self, toks):
+            return "".join(chr(int(x)) for x in toks)
+
+    monkeypatch.setattr(cider, "LLM", _FakeLLM)
+    monkeypatch.setattr(
+        cider,
+        "compress_tokens_sequential",
+        lambda llm, tokens, perfect, show_progress, coding_scheme=None: (np.array(tokens, dtype=np.uint32), 0.5),
+    )
+
+    inp = tmp_path / "in.txt"
+    out = tmp_path / "out.llmz"
+    inp.write_text("abcdef", encoding="utf-8")
+
+    monkeypatch.setattr(sys, "argv", ["cider.py", "compress", "--in", str(inp), "--out", str(out), "--model", "m", "--device", "cpu", "--dtype", "fp32", "--max-ctx", "5", "--no-progress"])
+    cider.main()
+    header, _, _ = cider.read_container(str(out))
+    assert header["cache_policy"] == "streaming_llm"
+    assert header["sink_tokens"] == 4
 
 
 def test_main_decompress_envhash_mismatch_exits(cider, monkeypatch, tmp_path):

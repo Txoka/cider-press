@@ -77,6 +77,8 @@ CODING_ENUM = {"range": 0, "ans": 1}
 CODING_ENUM_REV = {v: k for k, v in CODING_ENUM.items()}
 CONTENT_ENUM = {"text": 0, "text_archive": 1}
 CONTENT_ENUM_REV = {v: k for k, v in CONTENT_ENUM.items()}
+CACHE_POLICY_ENUM = {"dynamic": 0, "streaming_llm": 1}
+CACHE_POLICY_ENUM_REV = {v: k for k, v in CACHE_POLICY_ENUM.items()}
 
 
 def build_header_bytes(
@@ -95,13 +97,17 @@ def build_header_bytes(
     env_hash: Optional[bytes],
     coding_scheme: str = "range",
     content_kind: str = "text",
+    cache_policy: str = "dynamic",
+    sink_tokens: int = 4,
 ) -> bytes:
     if coding_scheme not in CODING_ENUM:
         raise ValueError(f"Unsupported coding scheme: {coding_scheme}")
     if content_kind not in CONTENT_ENUM:
         raise ValueError(f"Unsupported content kind: {content_kind}")
+    if cache_policy not in CACHE_POLICY_ENUM:
+        raise ValueError(f"Unsupported cache policy: {cache_policy}")
 
-    version = 6
+    version = 7
     flags = 0
     flags |= (1 if perfect else 0) << 0
     flags |= (1 if strict_det else 0) << 1
@@ -122,6 +128,8 @@ def build_header_bytes(
     hb += pack_bytes(env_hash)
     hb += uvarint_encode(CODING_ENUM[coding_scheme])
     hb += uvarint_encode(CONTENT_ENUM[content_kind])
+    hb += uvarint_encode(CACHE_POLICY_ENUM[cache_policy])
+    hb += uvarint_encode(int(sink_tokens))
     return bytes(hb)
 
 
@@ -129,6 +137,8 @@ def parse_header_bytes(hb: bytes) -> dict:
     off = 0
     coding_id = CODING_ENUM["range"]
     content_id = CONTENT_ENUM["text"]
+    cache_policy_id = CACHE_POLICY_ENUM["dynamic"]
+    sink_tokens = 4
     version, off = uvarint_decode(hb, off)
     if version == 1:
         flags, off = uvarint_decode(hb, off)
@@ -151,7 +161,7 @@ def parse_header_bytes(hb: bytes) -> dict:
         model_id, off = unpack_str(hb, off)
         revision, off = unpack_str(hb, off)
         env_hash, off = unpack_bytes(hb, off)
-    elif version in (3, 4, 5, 6):
+    elif version in (3, 4, 5, 6, 7):
         flags, off = uvarint_decode(hb, off)
         max_ctx, off = uvarint_decode(hb, off)
         n_tokens, off = uvarint_decode(hb, off)
@@ -167,6 +177,12 @@ def parse_header_bytes(hb: bytes) -> dict:
             content_id, off = uvarint_decode(hb, off)
         else:
             content_id = CONTENT_ENUM["text"]
+        if version >= 7:
+            cache_policy_id, off = uvarint_decode(hb, off)
+            sink_tokens, off = uvarint_decode(hb, off)
+        else:
+            cache_policy_id = CACHE_POLICY_ENUM["dynamic"]
+            sink_tokens = 4
     else:
         raise ValueError(f"Unsupported header version: {version}")
 
@@ -176,6 +192,8 @@ def parse_header_bytes(hb: bytes) -> dict:
         raise ValueError(f"Unsupported coding scheme id: {coding_id}")
     if int(content_id) not in CONTENT_ENUM_REV:
         raise ValueError(f"Unsupported content kind id: {content_id}")
+    if int(cache_policy_id) not in CACHE_POLICY_ENUM_REV:
+        raise ValueError(f"Unsupported cache policy id: {cache_policy_id}")
 
     is_cuda = bool((flags >> 6) & 1)
     dev = f"cuda:{cuda_idx}" if is_cuda else "cpu"
@@ -197,6 +215,8 @@ def parse_header_bytes(hb: bytes) -> dict:
         "env_hash": env_hash,
         "coding_scheme": CODING_ENUM_REV[int(coding_id)],
         "content_kind": CONTENT_ENUM_REV[int(content_id)],
+        "cache_policy": CACHE_POLICY_ENUM_REV[int(cache_policy_id)],
+        "sink_tokens": int(sink_tokens),
     }
     if version in (1, 2):
         out["n_words_u32"] = int(n_words_u32)
