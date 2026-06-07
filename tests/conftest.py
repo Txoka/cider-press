@@ -50,6 +50,9 @@ class _FakeEncoder:
     def encode(self, symbols, _model, _probs):
         self.data.append(int(symbols[0]))
 
+    def encode_reverse(self, symbols, _model, _probs):
+        self.data.extend(reversed([int(x) for x in symbols]))
+
     def get_compressed(self):
         return np.array(self.data, dtype=np.uint32)
 
@@ -63,6 +66,25 @@ class _FakeDecoder:
         if self.idx >= len(self.words):
             raise IndexError("decoder underflow")
         out = self.words[self.idx]
+        self.idx += 1
+        return np.array([out], dtype=np.int32)
+
+
+class _FakeAnsCoder(_FakeEncoder):
+    def __init__(self, words=None):
+        if words is None:
+            super().__init__()
+        else:
+            self.data = list(np.array(words, dtype=np.uint32).tolist())
+            self.idx = 0
+
+    def encode_reverse(self, symbols, _model, _probs):
+        self.data.extend([int(x) for x in symbols])
+
+    def decode(self, _model, _probs):
+        if self.idx >= len(self.data):
+            raise IndexError("decoder underflow")
+        out = self.data[self.idx]
         self.idx += 1
         return np.array([out], dtype=np.int32)
 
@@ -148,6 +170,7 @@ def _build_fake_constriction():
     mod.stream = types.SimpleNamespace(
         model=types.SimpleNamespace(Categorical=_FakeCategorical),
         queue=types.SimpleNamespace(RangeEncoder=_FakeEncoder, RangeDecoder=_FakeDecoder),
+        stack=types.SimpleNamespace(AnsCoder=_FakeAnsCoder),
     )
     return mod
 

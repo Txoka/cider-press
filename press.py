@@ -9,6 +9,10 @@ from ciderpress import app as _app
 from ciderpress.cli import build_parser
 from ciderpress import codec as _codec
 from ciderpress.container import (
+    CODING_ENUM,
+    CODING_ENUM_REV,
+    CONTENT_ENUM,
+    CONTENT_ENUM_REV,
     DTYPE_ENUM,
     DTYPE_ENUM_REV,
     MAGIC,
@@ -28,23 +32,33 @@ from ciderpress.fingerprint import ENV_HASH_NBYTES, env_fingerprint_hash_bytes, 
 from ciderpress.model import LLM, LLMConfig, Stepper, load_model
 
 
-def compress_tokens_sequential(llm, tokens, *, perfect, show_progress):
+def compress_tokens_sequential(llm, tokens, *, perfect, show_progress, coding_scheme=_codec.CODING_SCHEME_RANGE):
     return _codec.compress_tokens_sequential(
         llm,
         tokens,
         perfect=perfect,
         show_progress=show_progress,
+        coding_scheme=coding_scheme,
         stepper_cls=Stepper,
     )
 
 
-def decompress_tokens_sequential(llm, compressed_u32, *, n_tokens, perfect, show_progress):
+def decompress_tokens_sequential(
+    llm,
+    compressed_u32,
+    *,
+    n_tokens,
+    perfect,
+    show_progress,
+    coding_scheme=_codec.CODING_SCHEME_RANGE,
+):
     return _codec.decompress_tokens_sequential(
         llm,
         compressed_u32,
         n_tokens=n_tokens,
         perfect=perfect,
         show_progress=show_progress,
+        coding_scheme=coding_scheme,
         stepper_cls=Stepper,
     )
 
@@ -54,6 +68,7 @@ def cmd_compress(args) -> int:
         args,
         llm_cls=LLM,
         compress_fn=compress_tokens_sequential,
+        decompress_fn=decompress_tokens_sequential,
     )
 
 
